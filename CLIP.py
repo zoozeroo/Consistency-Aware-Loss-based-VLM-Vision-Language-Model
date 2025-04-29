@@ -112,7 +112,7 @@ print(f"Recall@5: {recall5:.4f}")
 print(f"Recall@10: {recall10:.4f}")
 
 # ==========================
-# 📝 Image Captioning (BLIP)
+# 📝 Image Captioning (BLIP) + 이미지 show()
 # ==========================
 
 def generate_caption(image):
@@ -123,10 +123,12 @@ def generate_caption(image):
 
 print("\n[Image Captioning Results - COCO]")
 for img_id in selected_ids[:5]:
-    file_path = os.path.join(COCO_IMAGE_DIR, id_to_filename[img_id])
+    file_name = id_to_filename[img_id]
+    file_path = os.path.join(COCO_IMAGE_DIR, file_name)
     image = Image.open(file_path).convert("RGB")
     gen_caption = generate_caption(image)
-    print(f"Generated Caption: {gen_caption}")
+    print(f"Image: {file_name} | Generated Caption: {gen_caption}")
+    image.show(title=f"{file_name}")
 
 # ==========================
 # ❓ Visual Question Answering (VQA)
