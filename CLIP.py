@@ -13,7 +13,6 @@ from PIL import Image
 import json
 import os
 from tqdm import tqdm
-from datasets import load_dataset
 
 # ==========================
 # ⚙️ 모델 로딩
@@ -37,6 +36,11 @@ vqa_model.eval()
 
 COCO_IMAGE_DIR = "./val2017"
 COCO_ANN_PATH = "annotations_trainval2017/annotations/captions_val2017.json"
+
+# 데이터 다운로드
+# https://cocodataset.org/#download
+# 2017 Val images [5K/1GB]
+# 2017 Train/Val annotations [241MB]
 
 # ==========================
 # 📚 캡션 로딩
@@ -131,27 +135,52 @@ for img_id in selected_ids[:5]:
     image.show(title=f"{file_name}")
 
 # ==========================
-# ❓ Visual Question Answering (VQA)
+# # ❓ Visual Question Answering (VQA) [데이터셋 링크 이상으로 보류]
+# # ==========================
+
+# vqa_data = load_dataset("HuggingFaceM4/VQAv2", split="validation", trust_remote_code=True)
+
+# print("\n[VQA Results - COCO + HuggingFace vqa]")
+# for sample in vqa_data.select(range(5)):
+#     image_id = sample["image_id"]
+#     question = sample["question"]
+#     answer = sample["answer"]
+
+#     file_name = f"{image_id:012d}.jpg"
+#     file_path = os.path.join(COCO_IMAGE_DIR, file_name)
+#     if not os.path.exists(file_path):
+#         print(f"Image not found: {file_name}")
+#         continue
+
+#     image = Image.open(file_path).convert("RGB")
+#     encoding = vqa_processor(image, question, return_tensors="pt")
+#     output = vqa_model(**encoding)
+#     pred_id = output.logits.argmax(-1).item()
+#     pred_answer = vqa_model.config.id2label[pred_id]
+
+#     print(f"Q: {question}\nPredicted: {pred_answer} | Ground Truth: {answer}\n")
+
+# ==========================
+# ❓ Custom VQA 실험
 # ==========================
 
-vqa_data = load_dataset("vqa_v2", split="validation")
+print("\n[Custom VQA Results - ViLT]")
+custom_vqa_samples = [
+    {"file": "000000179765.jpg", "question": "What is the vehicle in this image?"},
+    {"file": "000000190236.jpg", "question": "What shape is shown in the picture?"},
+    {"file": "000000331352.jpg", "question": "Is this a bathroom?"},
+    {"file": "000000517069.jpg", "question": "Where is the woman sitting?"},
+    {"file": "000000182417.jpg", "question": "Is there food on the table?"}
+]
 
-print("\n[VQA Results - COCO + HuggingFace vqa]")
-for sample in vqa_data.select(range(5)):
-    image_id = sample["image_id"]
-    question = sample["question"]
-    answer = sample["answer"]
-
-    file_name = f"{image_id:012d}.jpg"
-    file_path = os.path.join(COCO_IMAGE_DIR, file_name)
+for sample in custom_vqa_samples:
+    file_path = os.path.join(COCO_IMAGE_DIR, sample["file"])
     if not os.path.exists(file_path):
-        print(f"Image not found: {file_name}")
+        print(f"Image not found: {sample['file']}")
         continue
-
     image = Image.open(file_path).convert("RGB")
-    encoding = vqa_processor(image, question, return_tensors="pt")
-    output = vqa_model(**encoding)
-    pred_id = output.logits.argmax(-1).item()
+    inputs = vqa_processor(image, sample["question"], return_tensors="pt")
+    outputs = vqa_model(**inputs)
+    pred_id = outputs.logits.argmax(-1).item()
     pred_answer = vqa_model.config.id2label[pred_id]
-
-    print(f"Q: {question}\nPredicted: {pred_answer} | Ground Truth: {answer}\n")
+    print(f"Image: {sample['file']}\nQ: {sample['question']}\nA: {pred_answer}\n")
