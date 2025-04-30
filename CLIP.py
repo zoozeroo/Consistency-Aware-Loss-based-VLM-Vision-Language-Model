@@ -5,14 +5,14 @@
 import torch
 import torch.nn.functional as F
 from transformers import (
-    CLIPProcessor, CLIPModel,
-    BlipProcessor, BlipForConditionalGeneration,
-    ViltProcessor, ViltForQuestionAnswering
+    CLIPProcessor, CLIPModel
 )
 from PIL import Image
 import json
 import os
 from tqdm import tqdm
+from evaluate import load as load_metric
+
 
 # ==========================
 # ⚙️ 모델 로딩
@@ -21,14 +21,6 @@ from tqdm import tqdm
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 clip_model.eval()
-
-caption_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-caption_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-caption_model.eval()
-
-vqa_model = ViltForQuestionAnswering.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
-vqa_processor = ViltProcessor.from_pretrained("dandelin/vilt-b32-finetuned-vqa")
-vqa_model.eval()
 
 # ==========================
 # 📂 데이터 경로 설정
@@ -89,6 +81,7 @@ for img_id in id_to_captions.keys():
 selected_ids = valid_ids[:100]
 image_embeds_list = []
 text_embeds_list = []
+text_list = []
 
 for img_id in tqdm(selected_ids, desc="Encoding images and captions"):
     file_path = os.path.join(COCO_IMAGE_DIR, id_to_filename[img_id])
@@ -97,6 +90,7 @@ for img_id in tqdm(selected_ids, desc="Encoding images and captions"):
     img_embed, txt_embed = encode_image_text(image, caption)
     image_embeds_list.append(img_embed)
     text_embeds_list.append(txt_embed)
+    text_list.append(caption)
 
 if len(image_embeds_list) == 0 or len(text_embeds_list) == 0:
     print("❗ No valid image-caption pairs found. Check val2017 image folder or selected IDs.")
@@ -116,71 +110,64 @@ print(f"Recall@5: {recall5:.4f}")
 print(f"Recall@10: {recall10:.4f}")
 
 # ==========================
-# 📝 Image Captioning (BLIP) + 이미지 show()
+# 📝 간접 방식 Image Captioning 평가 (BLEU)
 # ==========================
 
-def generate_caption(image):
-    inputs = caption_processor(image, return_tensors="pt")
-    out = caption_model.generate(**inputs)
-    caption = caption_processor.decode(out[0], skip_special_tokens=True)
-    return caption
+print("\n[Indirect Captioning Evaluation - BLEU Metric]")
+metric = load_metric("bleu")
+predictions = []
+references = []
 
-print("\n[Image Captioning Results - COCO]")
-for img_id in selected_ids[:5]:
-    file_name = id_to_filename[img_id]
-    file_path = os.path.join(COCO_IMAGE_DIR, file_name)
-    image = Image.open(file_path).convert("RGB")
-    gen_caption = generate_caption(image)
-    print(f"Image: {file_name} | Generated Caption: {gen_caption}")
-    image.show(title=f"{file_name}")
+for i, img_id in enumerate(selected_ids[:20]):
+    pred_caption = text_list[sim_matrix[i].argmax().item()]
+    ref_captions = id_to_captions[img_id][:5]
+    predictions.append(pred_caption)
+    references.append(ref_captions)
 
-# ==========================
-# # ❓ Visual Question Answering (VQA) [데이터셋 링크 이상으로 보류]
-# # ==========================
-
-# vqa_data = load_dataset("HuggingFaceM4/VQAv2", split="validation", trust_remote_code=True)
-
-# print("\n[VQA Results - COCO + HuggingFace vqa]")
-# for sample in vqa_data.select(range(5)):
-#     image_id = sample["image_id"]
-#     question = sample["question"]
-#     answer = sample["answer"]
-
-#     file_name = f"{image_id:012d}.jpg"
-#     file_path = os.path.join(COCO_IMAGE_DIR, file_name)
-#     if not os.path.exists(file_path):
-#         print(f"Image not found: {file_name}")
-#         continue
-
-#     image = Image.open(file_path).convert("RGB")
-#     encoding = vqa_processor(image, question, return_tensors="pt")
-#     output = vqa_model(**encoding)
-#     pred_id = output.logits.argmax(-1).item()
-#     pred_answer = vqa_model.config.id2label[pred_id]
-
-#     print(f"Q: {question}\nPredicted: {pred_answer} | Ground Truth: {answer}\n")
+score = metric.compute(predictions=predictions, references=references)
+print(f"BLEU: {score['bleu']:.4f}")
 
 # ==========================
-# ❓ Custom VQA 실험
+# 🧠 간접 방식 VQA 평가 예시
 # ==========================
 
-print("\n[Custom VQA Results - ViLT]")
-custom_vqa_samples = [
-    {"file": "000000179765.jpg", "question": "What is the vehicle in this image?"},
-    {"file": "000000190236.jpg", "question": "What shape is shown in the picture?"},
-    {"file": "000000331352.jpg", "question": "Is this a bathroom?"},
-    {"file": "000000517069.jpg", "question": "Where is the woman sitting?"},
-    {"file": "000000182417.jpg", "question": "Is there food on the table?"}
+print("\n[Indirect VQA Evaluation - Matching Accuracy]")
+custom_vqa = [
+    {"image": "000000179765.jpg", "question": "What is the vehicle?", "choices": ["motorcycle", "bicycle", "car"]},
+    {"image": "000000331352.jpg", "question": "Is this a bathroom?", "choices": ["yes", "no"]},
+    {"image": "000000517069.jpg", "question": "Where is the person sitting?", "choices": ["on a bench", "on a sofa", "on the ground"]},
 ]
 
-for sample in custom_vqa_samples:
-    file_path = os.path.join(COCO_IMAGE_DIR, sample["file"])
-    if not os.path.exists(file_path):
-        print(f"Image not found: {sample['file']}")
-        continue
-    image = Image.open(file_path).convert("RGB")
-    inputs = vqa_processor(image, sample["question"], return_tensors="pt")
-    outputs = vqa_model(**inputs)
-    pred_id = outputs.logits.argmax(-1).item()
-    pred_answer = vqa_model.config.id2label[pred_id]
-    print(f"Image: {sample['file']}\nQ: {sample['question']}\nA: {pred_answer}\n")
+correct = 0
+for sample in custom_vqa:
+    image_path = os.path.join(COCO_IMAGE_DIR, sample["image"])
+    image = Image.open(image_path).convert("RGB")
+    img_inputs = clip_processor(images=image, return_tensors="pt")
+    ques_inputs = clip_processor(text=[sample["question"]], return_tensors="pt")
+
+    img_embed = clip_model.get_image_features(**img_inputs)
+    question_embed = clip_model.get_text_features(**ques_inputs)
+
+    choice_embeds = []
+    for ans in sample["choices"]:
+        ans_embed = clip_model.get_text_features(**clip_processor(text=[ans], return_tensors="pt"))
+        choice_embeds.append(ans_embed)
+
+    choice_embeds_all = torch.cat(choice_embeds, dim=0)
+    question_embed = F.normalize(question_embed, dim=-1)
+    choice_embeds_all = F.normalize(choice_embeds_all, dim=-1)
+
+    sim = torch.matmul(question_embed, choice_embeds_all.T)
+    pred_idx = torch.argmax(sim, dim=-1).item()
+    pred_answer = sample["choices"][pred_idx]
+
+    print(f"Image: {sample['image']}\nQ: {sample['question']}\nA: {pred_answer}\n")
+
+    if "answer" in sample and pred_answer == sample["answer"]:
+        correct += 1
+
+if any("answer" in s for s in custom_vqa):
+    acc = correct / sum("answer" in s for s in custom_vqa)
+    print(f"Accuracy: {acc:.2%}")
+else:
+    print("(Ground truth 정답이 포함되어 있지 않아 Accuracy 계산 생략)")
