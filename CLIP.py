@@ -12,7 +12,9 @@ import json
 import os
 from tqdm import tqdm
 from evaluate import load as load_metric
-
+from collections import defaultdict
+import random
+from pycocoevalcap.cider.cider import Cider
 
 # ==========================
 # ⚙️ 모델 로딩
@@ -41,91 +43,105 @@ COCO_ANN_PATH = "annotations_trainval2017/annotations/captions_val2017.json"
 with open(COCO_ANN_PATH, 'r') as f:
     coco_data = json.load(f)
 
-from collections import defaultdict
 id_to_captions = defaultdict(list)
 for ann in coco_data['annotations']:
     id_to_captions[ann['image_id']].append(ann['caption'])
 
 id_to_filename = {img['id']: img['file_name'] for img in coco_data['images']}
 
+# 전체 캡션 중에서 open-domain caption pool 구성
+caption_pool = []
+for caps in id_to_captions.values():
+    caption_pool.extend(caps)
+caption_pool = list(set(caption_pool))  # 중복 제거
+random.shuffle(caption_pool)
+caption_pool_subset = caption_pool[:5000]  # open-domain caption pool for captioning
+
 # ==========================
-# 🔍 Image-Text Retrieval (CLIP)
+# 🔍 이미지-텍스트 Retrieval 평가 (Closed-domain)
 # ==========================
 
-def encode_image_text(image, text):
-    inputs = clip_processor(text=[text], images=image, return_tensors="pt", padding=True)
-    outputs = clip_model(**inputs)
-    return outputs.image_embeds, outputs.text_embeds
-
-def cosine_similarity(img_embeds, text_embeds):
-    img_embeds = F.normalize(img_embeds, dim=-1)
-    text_embeds = F.normalize(text_embeds, dim=-1)
-    return torch.matmul(img_embeds, text_embeds.T)
-
-def compute_recall(similarity_matrix, k):
-    correct = 0
-    for i in range(similarity_matrix.size(0)):
-        values, indices = similarity_matrix[i].topk(k)
-        if i in indices:
-            correct += 1
-    return correct / similarity_matrix.size(0)
-
-# ▶ 유효한 이미지 ID만 필터링
 valid_ids = []
-for img_id in id_to_captions.keys():
-    if img_id in id_to_filename:
-        file_path = os.path.join(COCO_IMAGE_DIR, id_to_filename[img_id])
-        if os.path.exists(file_path):
-            valid_ids.append(img_id)
+for img_id in id_to_filename:
+    file_path = os.path.join(COCO_IMAGE_DIR, id_to_filename[img_id])
+    if os.path.exists(file_path):
+        valid_ids.append(img_id)
 
 selected_ids = valid_ids[:100]
 image_embeds_list = []
 text_embeds_list = []
 text_list = []
 
-for img_id in tqdm(selected_ids, desc="Encoding images and captions"):
+for img_id in tqdm(selected_ids, desc="Encoding image-text pairs"):
     file_path = os.path.join(COCO_IMAGE_DIR, id_to_filename[img_id])
     image = Image.open(file_path).convert("RGB")
-    caption = id_to_captions[img_id][0]
-    img_embed, txt_embed = encode_image_text(image, caption)
-    image_embeds_list.append(img_embed)
-    text_embeds_list.append(txt_embed)
+    caption = id_to_captions[img_id][0]  # closed-domain caption (GT)
+    inputs = clip_processor(images=image, text=[caption], return_tensors="pt", padding=True)
+    with torch.no_grad():
+        outputs = clip_model(**inputs)
+    image_embeds_list.append(outputs.image_embeds)
+    text_embeds_list.append(outputs.text_embeds)
     text_list.append(caption)
-
-if len(image_embeds_list) == 0 or len(text_embeds_list) == 0:
-    print("❗ No valid image-caption pairs found. Check val2017 image folder or selected IDs.")
-    exit()
 
 image_embeds_all = torch.cat(image_embeds_list, dim=0)
 text_embeds_all = torch.cat(text_embeds_list, dim=0)
 
-sim_matrix = cosine_similarity(image_embeds_all, text_embeds_all)
+image_embeds_all = F.normalize(image_embeds_all, dim=-1)
+text_embeds_all = F.normalize(text_embeds_all, dim=-1)
+
+sim_matrix = torch.matmul(image_embeds_all, text_embeds_all.T)
+
+def compute_recall(sim_matrix, k):
+    correct = 0
+    for i in range(sim_matrix.size(0)):
+        topk = sim_matrix[i].topk(k).indices
+        if i in topk:
+            correct += 1
+    return correct / sim_matrix.size(0)
+
 recall1 = compute_recall(sim_matrix, 1)
 recall5 = compute_recall(sim_matrix, 5)
 recall10 = compute_recall(sim_matrix, 10)
 
-print(f"\n[Image-Text Retrieval Results - COCO]")
+print("\n[Image-Text Retrieval Results (Closed-domain)]")
 print(f"Recall@1: {recall1:.4f}")
 print(f"Recall@5: {recall5:.4f}")
 print(f"Recall@10: {recall10:.4f}")
 
 # ==========================
-# 📝 간접 방식 Image Captioning 평가 (BLEU)
+# 📝 간접 방식 Captioning 평가 (Open-domain, CIDEr)
 # ==========================
 
-print("\n[Indirect Captioning Evaluation - BLEU Metric]")
-metric = load_metric("bleu")
-predictions = []
-references = []
+print("\n[Indirect Captioning Evaluation - CIDEr Metric (Open-domain)]")
+# 이미지 임베딩 재사용: image_embeds_all
+
+# open-domain caption pool embedding
+text_embeds = []
+for i in tqdm(range(0, len(caption_pool_subset), 64), desc="Encoding open-domain captions"):
+    batch = caption_pool_subset[i:i+64]
+    inputs = clip_processor(text=batch, return_tensors="pt", padding=True, truncation=True)
+    with torch.no_grad():
+        txt_embed = clip_model.get_text_features(**inputs)
+    text_embeds.append(txt_embed)
+
+text_embeds_all = torch.cat(text_embeds, dim=0)
+text_embeds_all = F.normalize(text_embeds_all, dim=-1)
+
+sim_matrix_captioning = torch.matmul(image_embeds_all, text_embeds_all.T)
+
+cider = Cider()
+pred_dict = {}
+ref_dict = {}
 
 for i, img_id in enumerate(selected_ids[:20]):
-    pred_caption = text_list[sim_matrix[i].argmax().item()]
+    best_idx = sim_matrix_captioning[i].argmax().item()
+    pred_caption = caption_pool_subset[best_idx]
     ref_captions = id_to_captions[img_id][:5]
-    predictions.append(pred_caption)
-    references.append(ref_captions)
+    pred_dict[str(i)] = [pred_caption]
+    ref_dict[str(i)] = ref_captions
 
-score = metric.compute(predictions=predictions, references=references)
-print(f"BLEU: {score['bleu']:.4f}")
+score, _ = cider.compute_score(ref_dict, pred_dict)
+print(f"CIDEr: {score:.4f}")
 
 # ==========================
 # 🧠 간접 방식 VQA 평가 예시
@@ -145,12 +161,14 @@ for sample in custom_vqa:
     img_inputs = clip_processor(images=image, return_tensors="pt")
     ques_inputs = clip_processor(text=[sample["question"]], return_tensors="pt")
 
-    img_embed = clip_model.get_image_features(**img_inputs)
-    question_embed = clip_model.get_text_features(**ques_inputs)
+    with torch.no_grad():
+        img_embed = clip_model.get_image_features(**img_inputs)
+        question_embed = clip_model.get_text_features(**ques_inputs)
 
     choice_embeds = []
     for ans in sample["choices"]:
-        ans_embed = clip_model.get_text_features(**clip_processor(text=[ans], return_tensors="pt"))
+        with torch.no_grad():
+            ans_embed = clip_model.get_text_features(**clip_processor(text=[ans], return_tensors="pt"))
         choice_embeds.append(ans_embed)
 
     choice_embeds_all = torch.cat(choice_embeds, dim=0)
